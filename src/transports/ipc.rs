@@ -14,11 +14,17 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{mpsc, oneshot},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::io::ReaderStream;
+
+#[cfg(windows)]
+use tokio::{
+    net::windows::named_pipe::{ClientOptions, NamedPipeClient},
+    time,
+};
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -30,11 +36,40 @@ pub struct Ipc {
     messages_tx: mpsc::UnboundedSender<TransportMessage>,
 }
 
+#[cfg(windows)]
+impl Ipc {
+    /// Creates a new IPC transport from a given path. The path must refer to a valid named pipe.
+    pub async fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        use std::time::Duration;
+        use winapi::shared::winerror;
+
+        let path = path.as_ref();
+        let pipe = loop {
+            match ClientOptions::new().open(path) {
+                Ok(pipe) => break pipe,
+                Err(e) if e.raw_os_error() == Some(winerror::ERROR_PIPE_BUSY as i32) => (),
+                Err(e) => return Err(e.into()),
+            }
+
+            time::sleep(Duration::from_millis(50)).await;
+        };
+
+        Ok(Self::with_stream(pipe))
+    }
+
+    fn with_stream(stream: NamedPipeClient) -> Self {
+        let id = Arc::new(AtomicUsize::new(0));
+        let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(run_server(stream, UnboundedReceiverStream::new(messages_rx)));
+
+        Ipc { id, messages_tx }
+    }
+}
+
 #[cfg(unix)]
 impl Ipc {
     /// Creates a new IPC transport from a given path.
-    ///
-    /// IPC is only available on Unix.
     pub async fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let stream = UnixStream::connect(path).await?;
 
@@ -159,13 +194,15 @@ enum TransportMessage {
     Unsubscribe(SubscriptionId),
 }
 
-#[cfg(unix)]
-async fn run_server(unix_stream: UnixStream, messages_rx: UnboundedReceiverStream<TransportMessage>) -> Result<()> {
-    let (socket_reader, mut socket_writer) = unix_stream.into_split();
+async fn run_server_generic<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send>(
+    pipe_reader: R,
+    mut pipe_writer: W,
+    messages_rx: UnboundedReceiverStream<TransportMessage>,
+) -> Result<()> {
     let mut pending_response_txs = BTreeMap::default();
     let mut subscription_txs = BTreeMap::default();
 
-    let mut socket_reader = ReaderStream::new(socket_reader);
+    let mut pipe_reader = ReaderStream::new(pipe_reader);
     let mut messages_rx = messages_rx.fuse();
     let mut read_buffer = vec![];
     let mut closed = false;
@@ -190,7 +227,7 @@ async fn run_server(unix_stream: UnixStream, messages_rx: UnboundedReceiverStrea
                     }
 
                     let bytes = helpers::to_string(&rpc::Request::Single(rpc_call)).into_bytes();
-                    if let Err(err) = socket_writer.write(&bytes).await {
+                    if let Err(err) = pipe_writer.write(&bytes).await {
                         pending_response_txs.remove(&request_id);
                         log::error!("IPC write error: {:?}", err);
                     }
@@ -210,7 +247,7 @@ async fn run_server(unix_stream: UnixStream, messages_rx: UnboundedReceiverStrea
 
                     let bytes = helpers::to_string(&rpc::Request::Batch(rpc_calls)).into_bytes();
 
-                    if let Err(err) = socket_writer.write(&bytes).await {
+                    if let Err(err) = pipe_writer.write(&bytes).await {
                         log::error!("IPC write error: {:?}", err);
                         for request_id in request_ids {
                             pending_response_txs.remove(&request_id);
@@ -218,7 +255,7 @@ async fn run_server(unix_stream: UnixStream, messages_rx: UnboundedReceiverStrea
                     }
                 }
             },
-            bytes = socket_reader.next() => match bytes {
+            bytes = pipe_reader.next() => match bytes {
                 Some(Ok(bytes)) => {
                     read_buffer.extend_from_slice(&bytes);
 
@@ -256,6 +293,18 @@ async fn run_server(unix_stream: UnixStream, messages_rx: UnboundedReceiverStrea
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+async fn run_server(named_pipe: NamedPipeClient, messages_rx: UnboundedReceiverStream<TransportMessage>) -> Result<()> {
+    let (read_pipe, write_pipe) = tokio::io::split(named_pipe);
+    run_server_generic(read_pipe, write_pipe, messages_rx).await
+}
+
+#[cfg(unix)]
+async fn run_server(unix_stream: UnixStream, messages_rx: UnboundedReceiverStream<TransportMessage>) -> Result<()> {
+    let (socket_reader, socket_writer) = unix_stream.into_split();
+    run_server_generic(socket_reader, socket_writer, messages_rx).await
 }
 
 fn notify(
